@@ -10,7 +10,6 @@ import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
-import android.net.wifi.WifiManager
 import android.view.Gravity
 import android.view.View
 import android.view.inputmethod.InputMethodManager
@@ -20,9 +19,13 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import java.net.ServerSocket
 import java.net.Socket
+import java.net.Inet4Address
+import java.net.NetworkInterface
+import java.net.InetSocketAddress
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.io.PrintWriter
+import java.util.Locale
 import java.util.concurrent.Executors
 import kotlin.math.atan2
 
@@ -30,6 +33,7 @@ class MainActivity : Activity(), SensorEventListener {
 
     private lateinit var sensorManager: SensorManager
     private var accelerometer: Sensor? = null
+
     private lateinit var angleText: TextView
     private lateinit var statusText: TextView
     private lateinit var ipText: TextView
@@ -50,7 +54,9 @@ class MainActivity : Activity(), SensorEventListener {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+        requestedOrientation =
+            ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+
         window.statusBarColor = bg
         window.navigationBarColor = bg
 
@@ -66,7 +72,11 @@ class MainActivity : Activity(), SensorEventListener {
             setBackgroundColor(bg)
         }
 
-        fun label(text: String, size: Float, color: Int): TextView {
+        fun label(
+            text: String,
+            size: Float,
+            color: Int
+        ): TextView {
             return TextView(this).apply {
                 this.text = text
                 textSize = size
@@ -79,7 +89,11 @@ class MainActivity : Activity(), SensorEventListener {
             typeface = Typeface.DEFAULT_BOLD
         }
 
-        val subtitle = label("WIRELESS CONTROLLER", 12f, Color.LTGRAY)
+        val subtitle = label(
+            "WIRELESS CONTROLLER",
+            12f,
+            Color.LTGRAY
+        )
 
         angleText = label("0.0°", 46f, white).apply {
             typeface = Typeface.DEFAULT_BOLD
@@ -103,7 +117,10 @@ class MainActivity : Activity(), SensorEventListener {
             gravity = Gravity.CENTER
         }
 
-        fun makeButton(text: String, action: () -> Unit): Button {
+        fun makeButton(
+            text: String,
+            action: () -> Unit
+        ): Button {
             return Button(this).apply {
                 this.text = text
                 setOnClickListener { action() }
@@ -128,7 +145,7 @@ class MainActivity : Activity(), SensorEventListener {
             if (isSender) {
                 connectToReceiver()
             } else {
-                statusText.text = "Choose SENDER first on the other phone"
+                statusText.text = "Choose SENDER on Redmi"
             }
         }
 
@@ -154,18 +171,27 @@ class MainActivity : Activity(), SensorEventListener {
     }
 
     private fun startReceiver() {
-        val ip = getWifiIp()
-
-        if (ip == null) {
-            statusText.text = "Connect to Wi-Fi first"
-            return
-        }
-
-        ipText.text = "Receiver IP: $ip"
-        statusText.text = "Starting receiver..."
+        statusText.text = "Finding Wi-Fi address..."
 
         network.execute {
+            val ip = getLocalIPv4()
+
+            runOnUiThread {
+                if (ip == null) {
+                    statusText.text =
+                        "No local IP found. Check Wi-Fi."
+                    ipText.text = "Receiver IP: unavailable"
+                    return@runOnUiThread
+                }
+
+                ipText.text = "Receiver IP: $ip"
+                statusText.text = "Starting receiver..."
+            }
+
+            if (ip == null) return@execute
+
             var server: ServerSocket? = null
+
             try {
                 server = ServerSocket(45678)
                 serverSocket = server
@@ -185,8 +211,9 @@ class MainActivity : Activity(), SensorEventListener {
                     InputStreamReader(client.getInputStream())
                 )
 
-                while (runningReceiver(server) && !client.isClosed) {
+                while (!server.isClosed && !client.isClosed) {
                     val line = reader.readLine() ?: break
+
                     runOnUiThread {
                         angleText.text = "$line°"
                     }
@@ -195,23 +222,68 @@ class MainActivity : Activity(), SensorEventListener {
                 runOnUiThread {
                     statusText.text = "Sender disconnected"
                 }
+
             } catch (e: Exception) {
                 runOnUiThread {
                     if (!isFinishing) {
-                        statusText.text = "Receiver stopped or connection failed"
+                        statusText.text =
+                            "Receiver stopped or connection failed"
                     }
                 }
             } finally {
                 try {
                     connection?.close()
                     server?.close()
-                } catch (_: Exception) {}
+                } catch (_: Exception) {
+                }
+
+                connection = null
+                serverSocket = null
             }
         }
     }
 
-    private fun runningReceiver(server: ServerSocket): Boolean {
-        return !server.isClosed && !isFinishing
+    private fun getLocalIPv4(): String? {
+        return try {
+            val interfaces = NetworkInterface.getNetworkInterfaces()
+                ?: return null
+
+            val addresses = mutableListOf<String>()
+
+            while (interfaces.hasMoreElements()) {
+                val networkInterface = interfaces.nextElement()
+
+                if (!networkInterface.isUp ||
+                    networkInterface.isLoopback
+                ) continue
+
+                val entries = networkInterface.inetAddresses
+
+                while (entries.hasMoreElements()) {
+                    val address = entries.nextElement()
+
+                    if (address is Inet4Address &&
+                        !address.isLoopbackAddress &&
+                        !address.isLinkLocalAddress
+                    ) {
+                        val ip = address.hostAddress ?: continue
+
+                        if (ip.startsWith("192.168.") ||
+                            ip.startsWith("10.") ||
+                            ip.matches(
+                                Regex("""172\.(1[6-9]|2[0-9]|3[01])\..*""")
+                            )
+                        ) {
+                            addresses.add(ip)
+                        }
+                    }
+                }
+            }
+
+            addresses.firstOrNull()
+        } catch (_: Exception) {
+            null
+        }
     }
 
     private fun connectToReceiver() {
@@ -225,20 +297,25 @@ class MainActivity : Activity(), SensorEventListener {
         val keyboard = getSystemService(
             Context.INPUT_METHOD_SERVICE
         ) as InputMethodManager
-        keyboard.hideSoftInputFromWindow(ipInput.windowToken, 0)
 
+        keyboard.hideSoftInputFromWindow(ipInput.windowToken, 0)
         statusText.text = "Connecting..."
 
         network.execute {
             try {
                 val client = Socket()
-                client.connect(java.net.InetSocketAddress(ip, 45678), 5000)
+                client.connect(
+                    InetSocketAddress(ip, 45678),
+                    5000
+                )
 
                 connection = client
-                writer = PrintWriter(client.getOutputStream(), true)
+                writer = PrintWriter(
+                    client.getOutputStream(),
+                    true
+                )
 
                 running = true
-                isSender = true
 
                 runOnUiThread {
                     statusText.text = "Connected - sending tilt"
@@ -246,6 +323,7 @@ class MainActivity : Activity(), SensorEventListener {
                 }
 
                 val sensor = accelerometer
+
                 if (sensor != null) {
                     sensorManager.registerListener(
                         this,
@@ -257,33 +335,13 @@ class MainActivity : Activity(), SensorEventListener {
                         statusText.text = "No accelerometer found"
                     }
                 }
+
             } catch (e: Exception) {
                 runOnUiThread {
-                    statusText.text = "Connection failed - check Wi-Fi and IP"
+                    statusText.text =
+                        "Connection failed. Check IP and Wi-Fi."
                 }
             }
-        }
-    }
-
-    private fun getWifiIp(): String? {
-        return try {
-            val wifi = applicationContext.getSystemService(
-                Context.WIFI_SERVICE
-            ) as WifiManager
-
-            @Suppress("DEPRECATION")
-            val address = wifi.connectionInfo.ipAddress
-
-            if (address == 0) {
-                null
-            } else {
-                "${address and 0xff}." +
-                    "${(address shr 8) and 0xff}." +
-                    "${(address shr 16) and 0xff}." +
-                    "${(address shr 24) and 0xff}"
-            }
-        } catch (_: Exception) {
-            null
         }
     }
 
@@ -292,27 +350,33 @@ class MainActivity : Activity(), SensorEventListener {
 
         val x = event.values[0]
         val y = event.values[1]
-        val angle = Math.toDegrees(atan2(x.toDouble(), y.toDouble()))
-        val value = String.format(java.util.Locale.US, "%.1f", angle)
+
+        val angle = Math.toDegrees(
+            atan2(x.toDouble(), y.toDouble())
+        )
+
+        val value = String.format(Locale.US, "%.1f", angle)
 
         runOnUiThread {
             angleText.text = "$value°"
         }
 
-        try {
-            writer?.println(value)
-            if (writer?.checkError() == true) {
-                runOnUiThread {
-                    statusText.text = "Connection lost"
-                }
-                stopEverything()
+        val currentWriter = writer ?: return
+        currentWriter.println(value)
+
+        if (currentWriter.checkError()) {
+            runOnUiThread {
+                statusText.text = "Connection lost"
             }
-        } catch (_: Exception) {
             stopEverything()
         }
     }
 
-    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+    override fun onAccuracyChanged(
+        sensor: Sensor?,
+        accuracy: Int
+    ) {
+    }
 
     private fun stopEverything() {
         running = false
@@ -322,7 +386,8 @@ class MainActivity : Activity(), SensorEventListener {
             writer?.close()
             connection?.close()
             serverSocket?.close()
-        } catch (_: Exception) {}
+        } catch (_: Exception) {
+        }
 
         writer = null
         connection = null
