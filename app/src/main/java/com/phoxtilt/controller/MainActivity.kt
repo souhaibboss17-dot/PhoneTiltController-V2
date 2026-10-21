@@ -1,60 +1,70 @@
+
 package com.phoxtilt.controller
 
+import android.Manifest
 import android.app.Activity
-import android.os.Bundle
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothServerSocket
+import android.bluetooth.BluetoothSocket
 import android.content.Context
-import android.content.pm.ActivityInfo
+import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
 import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
+import android.os.Build
+import android.os.Bundle
 import android.view.Gravity
 import android.view.View
 import android.view.inputmethod.InputMethodManager
-import android.widget.Button
-import android.widget.EditText
-import android.widget.LinearLayout
-import android.widget.TextView
-import java.net.ServerSocket
-import java.net.Socket
-import java.net.Inet4Address
-import java.net.NetworkInterface
-import java.net.InetSocketAddress
+import android.widget.*
+import android.app.AlertDialog
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.io.PrintWriter
 import java.util.Locale
+import java.util.UUID
 import java.util.concurrent.Executors
 import kotlin.math.atan2
 
 class MainActivity : Activity(), SensorEventListener {
 
+    companion object {
+        private val APP_UUID: UUID =
+            UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
+        private const val PERMISSION_REQUEST = 100
+        private const val ENABLE_BT_REQUEST = 101
+    }
+
     private lateinit var sensorManager: SensorManager
     private var accelerometer: Sensor? = null
     private lateinit var angleText: TextView
     private lateinit var statusText: TextView
-    private lateinit var ipText: TextView
-    private lateinit var ipInput: EditText
+    private lateinit var deviceText: TextView
 
     private val executor = Executors.newCachedThreadPool()
+    private var bluetoothAdapter: BluetoothAdapter? = null
 
     @Volatile private var running = false
     @Volatile private var isSender = false
-    @Volatile private var serverSocket: ServerSocket? = null
-    @Volatile private var connection: Socket? = null
+    @Volatile private var receiverMode = false
+    @Volatile private var serverSocket: BluetoothServerSocket? = null
+    @Volatile private var connection: BluetoothSocket? = null
     @Volatile private var writer: PrintWriter? = null
 
     private val bg = Color.rgb(12, 16, 25)
     private val green = Color.rgb(0, 235, 150)
-    private val white = Color.WHITE
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
         requestedOrientation =
-            ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+            android.content.pm.ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+
         window.statusBarColor = bg
         window.navigationBarColor = bg
 
@@ -62,11 +72,12 @@ class MainActivity : Activity(), SensorEventListener {
             getSystemService(Context.SENSOR_SERVICE) as SensorManager
         accelerometer =
             sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+        bluetoothAdapter = BluetoothAdapter.getDefaultAdapter()
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
-            setPadding(20, 8, 20, 8)
+            setPadding(16, 8, 16, 8)
             setBackgroundColor(bg)
         }
 
@@ -82,21 +93,12 @@ class MainActivity : Activity(), SensorEventListener {
             typeface = Typeface.DEFAULT_BOLD
         }
 
-        val subtitle = label("WIRELESS CONTROLLER", 12f, Color.LTGRAY)
-        angleText = label("0.0°", 46f, white).apply {
+        val subtitle = label("BLUETOOTH CONTROLLER", 12f, Color.LTGRAY)
+        angleText = label("0.0°", 46f, Color.WHITE).apply {
             typeface = Typeface.DEFAULT_BOLD
         }
+        deviceText = label("Bluetooth: not connected", 13f, Color.WHITE)
         statusText = label("Choose SENDER or RECEIVER", 14f, green)
-        ipText = label("Receiver IP: not started", 13f, white)
-
-        ipInput = EditText(this).apply {
-            hint = "Enter RECEIVER IP address"
-            setHintTextColor(Color.GRAY)
-            setTextColor(white)
-            setSingleLine(true)
-            textSize = 14f
-            visibility = View.GONE
-        }
 
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -112,202 +114,224 @@ class MainActivity : Activity(), SensorEventListener {
         row.addView(button("SENDER") {
             stopEverything()
             isSender = true
-            ipInput.visibility = View.VISIBLE
-            statusText.text = "Enter receiver IP, then CONNECT"
+            receiverMode = false
+            statusText.text = "Press CONNECT to choose paired phone"
         })
 
         row.addView(button("RECEIVER") {
+            if (!ensureBluetoothReady()) return@button
             stopEverything()
             isSender = false
-            ipInput.visibility = View.GONE
+            receiverMode = true
             startReceiver()
         })
 
         row.addView(button("CONNECT") {
-            if (isSender) connectToReceiver()
-            else statusText.text = "Choose SENDER on Redmi"
+            if (!isSender) {
+                statusText.text = "Choose SENDER first"
+            } else if (ensureBluetoothReady()) {
+                choosePairedDevice()
+            }
         })
 
         row.addView(button("STOP") {
             stopEverything()
             statusText.text = "Stopped"
+            deviceText.text = "Bluetooth: disconnected"
         })
 
         root.addView(title)
         root.addView(subtitle)
         root.addView(angleText)
-        root.addView(ipText)
-        root.addView(ipInput)
+        root.addView(deviceText)
         root.addView(statusText)
         root.addView(row)
+
         setContentView(root)
     }
 
-    private fun startReceiver() {
-        statusText.text = "Finding network address..."
+    private fun ensureBluetoothReady(): Boolean {
+        val adapter = bluetoothAdapter
 
-        executor.execute {
-            val ip = findLocalIPv4()
+        if (adapter == null) {
+            statusText.text = "This phone has no Bluetooth"
+            return false
+        }
 
-            runOnUiThread {
-                if (ip == null) {
-                    ipText.text = "Receiver IP: unavailable"
-                    statusText.text = "No local IP found. Check Wi-Fi."
-                } else {
-                    ipText.text = "Receiver IP: $ip"
-                    statusText.text = "Starting receiver..."
-                }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+            checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            requestPermissions(
+                arrayOf(Manifest.permission.BLUETOOTH_CONNECT),
+                PERMISSION_REQUEST
+            )
+            statusText.text = "Allow Bluetooth permission, then try again"
+            return false
+        }
+
+        return try {
+            if (!adapter.isEnabled) {
+                startActivityForResult(
+                    Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE),
+                    ENABLE_BT_REQUEST
+                )
+                statusText.text = "Enable Bluetooth, then try again"
+                false
+            } else {
+                true
+            }
+        } catch (_: SecurityException) {
+            statusText.text = "Bluetooth permission required"
+            false
+        }
+    }
+
+    private fun choosePairedDevice() {
+        try {
+            val devices = bluetoothAdapter?.bondedDevices?.toList()
+                ?: emptyList()
+
+            if (devices.isEmpty()) {
+                statusText.text = "Pair the phones in Bluetooth settings first"
+                return
             }
 
-            if (ip == null) return@execute
+            val labels = devices.map {
+                "${it.name ?: "Bluetooth device"}  (${it.address})"
+            }.toTypedArray()
 
-            var server: ServerSocket? = null
+            AlertDialog.Builder(this)
+                .setTitle("Choose Samsung receiver")
+                .setItems(labels) { _, index ->
+                    connectToDevice(devices[index])
+                }
+                .setNegativeButton("Cancel", null)
+                .show()
+        } catch (_: SecurityException) {
+            statusText.text = "Bluetooth permission required"
+        }
+    }
+
+    private fun startReceiver() {
+        statusText.text = "Starting Bluetooth receiver..."
+        deviceText.text = "Waiting for sender"
+
+        executor.execute {
+            var server: BluetoothServerSocket? = null
 
             try {
-                server = ServerSocket(45678)
+                server = bluetoothAdapter!!.listenUsingRfcommWithServiceRecord(
+                    "PhoneTiltController",
+                    APP_UUID
+                )
                 serverSocket = server
 
                 runOnUiThread {
-                    statusText.text = "Waiting for sender..."
+                    statusText.text = "Waiting for Redmi sender..."
                 }
 
-                val client = server.accept()
-                connection = client
+                while (receiverMode && !server.isClosed) {
+                    val client = server.accept()
+                    if (!receiverMode) {
+                        client.close()
+                        break
+                    }
 
-                runOnUiThread {
-                    statusText.text = "SENDER CONNECTED"
-                }
-
-                val reader = BufferedReader(
-                    InputStreamReader(client.getInputStream())
-                )
-
-                while (!client.isClosed && !server.isClosed) {
-                    val line = reader.readLine() ?: break
+                    connection = client
 
                     runOnUiThread {
-                        angleText.text = "$line°"
+                        deviceText.text = "Bluetooth: connected"
+                        statusText.text = "SENDER CONNECTED"
+                    }
+
+                    try {
+                        val reader = BufferedReader(
+                            InputStreamReader(client.inputStream)
+                        )
+
+                        while (receiverMode && !client.isClosed) {
+                            val line = reader.readLine() ?: break
+                            runOnUiThread {
+                                angleText.text = "$line°"
+                            }
+                        }
+                    } finally {
+                        try {
+                            client.close()
+                        } catch (_: Exception) {
+                        }
+
+                        if (connection === client) connection = null
+
+                        runOnUiThread {
+                            if (receiverMode) {
+                                deviceText.text = "Bluetooth: disconnected"
+                                statusText.text = "Waiting for sender again..."
+                            }
+                        }
                     }
                 }
-
+            } catch (_: Exception) {
                 runOnUiThread {
-                    statusText.text = "Sender disconnected"
-                }
-            } catch (e: Exception) {
-                runOnUiThread {
-                    if (!isFinishing) {
-                        statusText.text = "Receiver stopped or connection error"
+                    if (receiverMode && !isFinishing) {
+                        statusText.text = "Receiver stopped or Bluetooth error"
                     }
                 }
             } finally {
                 try {
-                    connection?.close()
                     server?.close()
                 } catch (_: Exception) {
                 }
-                connection = null
-                serverSocket = null
+                if (serverSocket === server) serverSocket = null
             }
         }
     }
 
-    private fun findLocalIPv4(): String? {
-        return try {
-            val interfaces = NetworkInterface.getNetworkInterfaces()
-                ?: return null
-            val addresses = mutableListOf<String>()
-
-            while (interfaces.hasMoreElements()) {
-                val net = interfaces.nextElement()
-                if (!net.isUp || net.isLoopback) continue
-
-                val entries = net.inetAddresses
-                while (entries.hasMoreElements()) {
-                    val address = entries.nextElement()
-                    if (address !is Inet4Address ||
-                        address.isLoopbackAddress ||
-                        address.isLinkLocalAddress
-                    ) continue
-
-                    val ip = address.hostAddress ?: continue
-                    if (ip.startsWith("192.168.") ||
-                        ip.startsWith("10.") ||
-                        ip.matches(
-                            Regex("""172\.(1[6-9]|2[0-9]|3[01])\..*""")
-                        )
-                    ) {
-                        addresses.add(ip)
-                    }
-                }
-            }
-            addresses.firstOrNull()
-        } catch (_: Exception) {
-            null
-        }
-    }
-
-    private fun connectToReceiver() {
-        val ip = ipInput.text.toString().trim()
-
-        if (ip.isEmpty()) {
-            statusText.text = "Enter receiver IP first"
-            return
-        }
-
-        val keyboard = getSystemService(
-            Context.INPUT_METHOD_SERVICE
-        ) as InputMethodManager
-        keyboard.hideSoftInputFromWindow(ipInput.windowToken, 0)
-
-        statusText.text = "Connecting..."
+    private fun connectToDevice(device: BluetoothDevice) {
+        statusText.text = "Connecting by Bluetooth..."
+        deviceText.text = "Connecting..."
 
         executor.execute {
-            var client: Socket? = null
+            var socket: BluetoothSocket? = null
 
             try {
-                client = Socket()
-                client.connect(InetSocketAddress(ip, 45678), 5000)
+                socket = device.createRfcommSocketToServiceRecord(APP_UUID)
+                socket.connect()
 
-                val output = PrintWriter(
-                    client.getOutputStream(),
-                    true
-                )
+                val output = PrintWriter(socket.outputStream, true)
 
-                connection = client
+                connection = socket
                 writer = output
 
                 runOnUiThread {
                     if (accelerometer == null) {
                         statusText.text = "No accelerometer found"
-                        try {
-                            client?.close()
-                        } catch (_: Exception) {
-                        }
+                        stopEverything()
                         return@runOnUiThread
                     }
 
                     running = true
-                    isSender = true
+                    deviceText.text = "Connected to ${device.name ?: device.address}"
+                    statusText.text = "Connected - sending tilt"
 
                     sensorManager.registerListener(
                         this@MainActivity,
                         accelerometer,
                         SensorManager.SENSOR_DELAY_GAME
                     )
-
-                    statusText.text = "Connected - sending tilt"
-                    ipText.text = "Connected to $ip"
                 }
-            } catch (e: Exception) {
+            } catch (_: Exception) {
                 try {
-                    client?.close()
+                    socket?.close()
                 } catch (_: Exception) {
                 }
 
                 running = false
                 runOnUiThread {
+                    deviceText.text = "Bluetooth: disconnected"
                     statusText.text =
-                        "Connection failed. Check IP and Wi-Fi."
+                        "Connection failed. Start RECEIVER on Samsung first."
                 }
             }
         }
@@ -333,25 +357,40 @@ class MainActivity : Activity(), SensorEventListener {
         output.println(value)
 
         if (output.checkError()) {
-            runOnUiThread {
-                statusText.text = "Connection lost"
+            running = false
+            sensorManager.unregisterListener(this)
+            try {
+                connection?.close()
+            } catch (_: Exception) {
             }
-            stopEverything()
+            writer = null
+            connection = null
+
+            runOnUiThread {
+                deviceText.text = "Bluetooth: disconnected"
+                statusText.text = "Connection lost. Press CONNECT to retry."
+            }
         }
     }
 
-    override fun onAccuracyChanged(
-        sensor: Sensor?,
-        accuracy: Int
-    ) {}
+    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
 
     private fun stopEverything() {
         running = false
+        receiverMode = false
         sensorManager.unregisterListener(this)
 
         try {
             writer?.close()
+        } catch (_: Exception) {
+        }
+
+        try {
             connection?.close()
+        } catch (_: Exception) {
+        }
+
+        try {
             serverSocket?.close()
         } catch (_: Exception) {
         }
@@ -359,11 +398,6 @@ class MainActivity : Activity(), SensorEventListener {
         writer = null
         connection = null
         serverSocket = null
-    }
-
-    override fun onPause() {
-        super.onPause()
-        sensorManager.unregisterListener(this)
     }
 
     override fun onDestroy() {
