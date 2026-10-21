@@ -1,8 +1,8 @@
-
 package com.phoxtilt.controller
 
 import android.Manifest
 import android.app.Activity
+import android.app.AlertDialog
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothServerSocket
@@ -10,6 +10,7 @@ import android.bluetooth.BluetoothSocket
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.pm.ActivityInfo
 import android.graphics.Color
 import android.graphics.Typeface
 import android.hardware.Sensor
@@ -19,10 +20,9 @@ import android.hardware.SensorManager
 import android.os.Build
 import android.os.Bundle
 import android.view.Gravity
-import android.view.View
-import android.view.inputmethod.InputMethodManager
-import android.widget.*
-import android.app.AlertDialog
+import android.widget.Button
+import android.widget.LinearLayout
+import android.widget.TextView
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.io.PrintWriter
@@ -34,7 +34,7 @@ import kotlin.math.atan2
 class MainActivity : Activity(), SensorEventListener {
 
     companion object {
-        private val APP_UUID: UUID =
+        private val APP_UUID =
             UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
         private const val PERMISSION_REQUEST = 100
         private const val ENABLE_BT_REQUEST = 101
@@ -61,17 +61,12 @@ class MainActivity : Activity(), SensorEventListener {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
-        requestedOrientation =
-            android.content.pm.ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
-
+        requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
         window.statusBarColor = bg
         window.navigationBarColor = bg
 
-        sensorManager =
-            getSystemService(Context.SENSOR_SERVICE) as SensorManager
-        accelerometer =
-            sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+        sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
+        accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
         bluetoothAdapter = BluetoothAdapter.getDefaultAdapter()
 
         val root = LinearLayout(this).apply {
@@ -92,7 +87,6 @@ class MainActivity : Activity(), SensorEventListener {
         val title = label("PHONE TILT", 27f, green).apply {
             typeface = Typeface.DEFAULT_BOLD
         }
-
         val subtitle = label("BLUETOOTH CONTROLLER", 12f, Color.LTGRAY)
         angleText = label("0.0°", 46f, Color.WHITE).apply {
             typeface = Typeface.DEFAULT_BOLD
@@ -146,22 +140,23 @@ class MainActivity : Activity(), SensorEventListener {
         root.addView(deviceText)
         root.addView(statusText)
         root.addView(row)
-
         setContentView(root)
+    }
+
+    private fun hasBluetoothPermission(): Boolean {
+        return Build.VERSION.SDK_INT < Build.VERSION_CODES.S ||
+            checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) ==
+            PackageManager.PERMISSION_GRANTED
     }
 
     private fun ensureBluetoothReady(): Boolean {
         val adapter = bluetoothAdapter
-
         if (adapter == null) {
             statusText.text = "This phone has no Bluetooth"
             return false
         }
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
-            checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT)
-            != PackageManager.PERMISSION_GRANTED
-        ) {
+        if (!hasBluetoothPermission()) {
             requestPermissions(
                 arrayOf(Manifest.permission.BLUETOOTH_CONNECT),
                 PERMISSION_REQUEST
@@ -178,9 +173,7 @@ class MainActivity : Activity(), SensorEventListener {
                 )
                 statusText.text = "Enable Bluetooth, then try again"
                 false
-            } else {
-                true
-            }
+            } else true
         } catch (_: SecurityException) {
             statusText.text = "Bluetooth permission required"
             false
@@ -193,12 +186,12 @@ class MainActivity : Activity(), SensorEventListener {
                 ?: emptyList()
 
             if (devices.isEmpty()) {
-                statusText.text = "Pair the phones in Bluetooth settings first"
+                statusText.text = "Pair phones in Bluetooth settings first"
                 return
             }
 
             val labels = devices.map {
-                "${it.name ?: "Bluetooth device"}  (${it.address})"
+                "${it.name ?: "Bluetooth device"} (${it.address})"
             }.toTypedArray()
 
             AlertDialog.Builder(this)
@@ -219,19 +212,14 @@ class MainActivity : Activity(), SensorEventListener {
 
         executor.execute {
             var server: BluetoothServerSocket? = null
-
             try {
                 server = bluetoothAdapter!!.listenUsingRfcommWithServiceRecord(
-                    "PhoneTiltController",
-                    APP_UUID
+                    "PhoneTiltController", APP_UUID
                 )
                 serverSocket = server
+                runOnUiThread { statusText.text = "Waiting for Redmi sender..." }
 
-                runOnUiThread {
-                    statusText.text = "Waiting for Redmi sender..."
-                }
-
-                while (receiverMode && !server.isClosed) {
+                while (receiverMode) {
                     val client = server.accept()
                     if (!receiverMode) {
                         client.close()
@@ -239,7 +227,6 @@ class MainActivity : Activity(), SensorEventListener {
                     }
 
                     connection = client
-
                     runOnUiThread {
                         deviceText.text = "Bluetooth: connected"
                         statusText.text = "SENDER CONNECTED"
@@ -249,21 +236,13 @@ class MainActivity : Activity(), SensorEventListener {
                         val reader = BufferedReader(
                             InputStreamReader(client.inputStream)
                         )
-
-                        while (receiverMode && !client.isClosed) {
+                        while (receiverMode && client.isConnected) {
                             val line = reader.readLine() ?: break
-                            runOnUiThread {
-                                angleText.text = "$line°"
-                            }
+                            runOnUiThread { angleText.text = "$line°" }
                         }
                     } finally {
-                        try {
-                            client.close()
-                        } catch (_: Exception) {
-                        }
-
+                        try { client.close() } catch (_: Exception) {}
                         if (connection === client) connection = null
-
                         runOnUiThread {
                             if (receiverMode) {
                                 deviceText.text = "Bluetooth: disconnected"
@@ -279,10 +258,7 @@ class MainActivity : Activity(), SensorEventListener {
                     }
                 }
             } finally {
-                try {
-                    server?.close()
-                } catch (_: Exception) {
-                }
+                try { server?.close() } catch (_: Exception) {}
                 if (serverSocket === server) serverSocket = null
             }
         }
@@ -294,13 +270,10 @@ class MainActivity : Activity(), SensorEventListener {
 
         executor.execute {
             var socket: BluetoothSocket? = null
-
             try {
                 socket = device.createRfcommSocketToServiceRecord(APP_UUID)
                 socket.connect()
-
                 val output = PrintWriter(socket.outputStream, true)
-
                 connection = socket
                 writer = output
 
@@ -312,9 +285,8 @@ class MainActivity : Activity(), SensorEventListener {
                     }
 
                     running = true
-                    deviceText.text = "Connected to ${device.name ?: device.address}"
+                    deviceText.text = "Bluetooth: connected"
                     statusText.text = "Connected - sending tilt"
-
                     sensorManager.registerListener(
                         this@MainActivity,
                         accelerometer,
@@ -322,11 +294,7 @@ class MainActivity : Activity(), SensorEventListener {
                     )
                 }
             } catch (_: Exception) {
-                try {
-                    socket?.close()
-                } catch (_: Exception) {
-                }
-
+                try { socket?.close() } catch (_: Exception) {}
                 running = false
                 runOnUiThread {
                     deviceText.text = "Bluetooth: disconnected"
@@ -341,17 +309,10 @@ class MainActivity : Activity(), SensorEventListener {
         if (!running || !isSender || event == null) return
 
         val angle = Math.toDegrees(
-            atan2(
-                event.values[0].toDouble(),
-                event.values[1].toDouble()
-            )
+            atan2(event.values[0].toDouble(), event.values[1].toDouble())
         )
-
         val value = String.format(Locale.US, "%.1f", angle)
-
-        runOnUiThread {
-            angleText.text = "$value°"
-        }
+        angleText.post { angleText.text = "$value°" }
 
         val output = writer ?: return
         output.println(value)
@@ -359,13 +320,9 @@ class MainActivity : Activity(), SensorEventListener {
         if (output.checkError()) {
             running = false
             sensorManager.unregisterListener(this)
-            try {
-                connection?.close()
-            } catch (_: Exception) {
-            }
+            try { connection?.close() } catch (_: Exception) {}
             writer = null
             connection = null
-
             runOnUiThread {
                 deviceText.text = "Bluetooth: disconnected"
                 statusText.text = "Connection lost. Press CONNECT to retry."
@@ -379,22 +336,9 @@ class MainActivity : Activity(), SensorEventListener {
         running = false
         receiverMode = false
         sensorManager.unregisterListener(this)
-
-        try {
-            writer?.close()
-        } catch (_: Exception) {
-        }
-
-        try {
-            connection?.close()
-        } catch (_: Exception) {
-        }
-
-        try {
-            serverSocket?.close()
-        } catch (_: Exception) {
-        }
-
+        try { writer?.close() } catch (_: Exception) {}
+        try { connection?.close() } catch (_: Exception) {}
+        try { serverSocket?.close() } catch (_: Exception) {}
         writer = null
         connection = null
         serverSocket = null
